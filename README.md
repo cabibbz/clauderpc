@@ -1,10 +1,12 @@
-# clauderpc — Discord Rich Presence for Claude Code
+﻿# clauderpc — Discord Rich Presence for Claude Code
 
 While you work in Claude Code, your Discord profile shows a live activity banner (the slot where games appear) with three lines:
 
 1. **App name** — whatever you name the Discord application (e.g. "Claude Code")
 2. **Details** — the model name (e.g. "Fable 5")
 3. **State + timer** — what Claude is doing ("Reasoning" / "Running tool" / "Idle") and elapsed time since the last state change
+
+**Download:** grab claude-rpc-win64.zip from [Releases](https://github.com/cabibbz/clauderpc/releases) — no Python needed. Unzip, keep the EXE next to its `_internal` folder, double-click.
 
 Sibling project: [codexrpc](https://github.com/cabibbz/codexrpc) does the same for OpenAI Codex (CLI + desktop app) via PID attachment.
 
