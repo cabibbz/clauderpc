@@ -1,0 +1,62 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\path\\to\\dist\\claude-rpc\\claude-rpc.exe\" idle",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\path\\to\\dist\\claude-rpc\\claude-rpc.exe\" thinking",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\path\\to\\dist\\claude-rpc\\claude-rpc.exe\" tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\path\\to\\dist\\claude-rpc\\claude-rpc.exe\" thinking",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"C:\\path\\to\\dist\\claude-rpc\\claude-rpc.exe\" idle",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
