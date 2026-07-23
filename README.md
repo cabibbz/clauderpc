@@ -32,8 +32,10 @@ Requires Python 3.11+ on **Windows** (PyInstaller can't cross-compile — a Wind
 
 ```powershell
 py -m pip install pypresence pyinstaller
-py -m PyInstaller --onedir --noconsole --name claude-rpc --noconfirm claude_rpc.py
+py -m PyInstaller --onedir --noconsole --icon claude-rpc.ico --add-data "claude-rpc.ico;." --name claude-rpc --noconfirm claude_rpc.py
 ```
+
+`--icon` sets the EXE's file icon; `--add-data` ships the same `.ico` inside the bundle so the app window and taskbar entry use it too. To regenerate the icon from other artwork: `py make_icons.py <source-image> claude-rpc.ico preview.png` (add `--tile` to place monochrome art on a white rounded tile so it stays visible on dark taskbars).
 
 Output: `dist\claude-rpc\claude-rpc.exe` (plus its `_internal` folder — keep them together).
 
