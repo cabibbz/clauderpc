@@ -24,6 +24,24 @@ STATE_FILE = os.path.join(TEMP, "claude_rpc")
 MODEL_FILE = os.path.join(TEMP, "claude_rpc_model")
 HEARTBEAT_FILE = os.path.join(TEMP, "claude_rpc_daemon.json")
 LOG_FILE = os.path.join(TEMP, "claude_rpc_daemon.log")
+CONFIG_FILE = os.path.join(os.environ.get("APPDATA") or TEMP, "claude-rpc.json")
+
+
+def get_app_id() -> str:
+    """Env var wins; otherwise the ID saved from the UI."""
+    app_id = (os.environ.get("DISCORD_APP_ID") or "").strip()
+    if app_id:
+        return app_id
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return str(json.load(f).get("app_id") or "").strip()
+    except Exception:
+        return ""
+
+
+def save_app_id(app_id: str) -> None:
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"app_id": app_id.strip()}, f)
 
 VALID_STATUSES = ("thinking", "tool", "idle")
 
@@ -177,10 +195,14 @@ def connect(app_id: str):
 
 
 def daemon_mode() -> int:
-    app_id = os.environ.get("DISCORD_APP_ID")
+    app_id = get_app_id()
     if not app_id:
-        log("error: DISCORD_APP_ID environment variable is not set")
-        return 1
+        log("no Application ID yet; waiting (enter it in the UI and Save)")
+        while not app_id:
+            write_heartbeat(discord="no_app_id")
+            time.sleep(TICK_SECONDS)
+            app_id = get_app_id()
+        log("Application ID received")
 
     if daemon_pid():
         log("daemon already running; exiting")
@@ -320,9 +342,42 @@ def ui_mode() -> int:
     stop_btn = styled_btn("Stop daemon", stop_daemon)
     stop_btn.pack(side="left", padx=(8, 0))
 
+    idrow = tk.Frame(root, bg=BG)
+    idrow.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+    tk.Label(idrow, text="Application ID", bg=BG, fg=DIM,
+             font=("Segoe UI", 9)).pack(side="left")
+    id_var = tk.StringVar(value=get_app_id())
+    tk.Entry(idrow, textvariable=id_var, bg=CARD, fg=FG, insertbackground=FG,
+             relief="flat", width=24, font=("Consolas", 9)).pack(side="left",
+                                                                 padx=(8, 8))
+    id_msg = tk.Label(idrow, text="", bg=BG, fg=YELLOW, font=("Segoe UI", 8))
+
+    def save_id():
+        val = id_var.get().strip()
+        if not val.isdigit():
+            id_msg.config(text="App ID must be a number (from discord.com/developers)")
+            return
+        try:
+            save_app_id(val)
+        except OSError as exc:
+            id_msg.config(text=f"Could not save: {exc}")
+            return
+        if os.environ.get("DISCORD_APP_ID", "").strip() not in ("", val):
+            id_msg.config(text="Saved — but the DISCORD_APP_ID env var overrides it")
+        else:
+            id_msg.config(text="Saved")
+        if daemon_pid():  # restart so the daemon reconnects with the new ID
+            stop_daemon()
+            start_daemon()
+
+    tk.Button(idrow, text="Save", command=save_id, bg=CARD, fg=FG,
+              activebackground="#404249", activeforeground=FG, relief="flat",
+              font=("Segoe UI", 9), padx=12, pady=2).pack(side="left")
+    id_msg.pack(side="left", padx=(8, 0))
+
     log_box = tk.Text(root, height=6, width=52, bg=CARD, fg=DIM, relief="flat",
                       font=("Consolas", 8), state="disabled", padx=8, pady=6)
-    log_box.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+    log_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
 
     def fmt_elapsed(since):
         if not since:
@@ -339,6 +394,8 @@ def ui_mode() -> int:
             daemon_val.config(text=f"● Running (pid {pid})", fg=GREEN)
             if hb.get("discord") == "connected":
                 discord_val.config(text="Connected", fg=GREEN)
+            elif hb.get("discord") == "no_app_id":
+                discord_val.config(text="Waiting for Application ID — enter it below", fg=YELLOW)
             else:
                 discord_val.config(text="Waiting for Discord…", fg=YELLOW)
             model, activity = hb.get("model"), hb.get("activity")
@@ -355,11 +412,10 @@ def ui_mode() -> int:
             discord_val.config(text="—", fg=DIM)
             activity_val.config(text="—", fg=DIM)
             timer_val.config(text="—", fg=DIM)
-            start_btn.config(state="normal" if os.environ.get("DISCORD_APP_ID")
-                             else "disabled")
+            start_btn.config(state="normal")
             stop_btn.config(state="disabled")
-            if not os.environ.get("DISCORD_APP_ID"):
-                activity_val.config(text="DISCORD_APP_ID not set", fg=RED)
+            if not get_app_id():
+                activity_val.config(text="Enter your Application ID below and Save", fg=YELLOW)
 
         try:
             with open(LOG_FILE, "r", encoding="utf-8") as f:

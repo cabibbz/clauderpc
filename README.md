@@ -41,7 +41,9 @@ Output: `dist\claude-rpc\claude-rpc.exe` (plus its `_internal` folder — keep t
 
 ## 3. Set the Application ID
 
-Persist it user-wide (new terminals pick it up; already-open ones won't):
+**In the app:** double-click `claude-rpc.exe`, paste the Application ID into the field at the bottom, hit **Save**. It's stored in `%APPDATA%\claude-rpc.json`; a running daemon is restarted automatically, and a daemon started without an ID waits and picks it up the moment you save.
+
+Optional override via environment variable (takes precedence over the saved ID):
 
 ```powershell
 setx DISCORD_APP_ID <your-application-id>
