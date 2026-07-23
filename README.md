@@ -55,7 +55,13 @@ setx DISCORD_APP_ID <your-application-id>
 
 ## 4. Hook config
 
-Copy [`settings.example.json`](settings.example.json) into your project's `.claude/settings.json` (project-local activation) or merge into `%USERPROFILE%\.claude\settings.json` (global), replacing the EXE path with your **absolute path**. Mapping:
+**The easy way:** in the app, click **Setup hooks…**, pick the folder you run Claude Code in, and click **Wire hooks here** (or **Wire globally** for every project). It writes the absolute path to *this* EXE into all five events.
+
+It merges rather than overwrites: anything already in your `settings.json` — other hooks, `permissions`, `env`, matchers on the same events — is preserved, only this app's entries are added or updated, and a `.bak` copy is saved first. Re-running is safe and idempotent, and it repoints entries left behind by an older install. **Remove hooks** cleanly reverses it, leaving your own hooks untouched.
+
+Then restart your Claude Code session in that folder — hooks load at session start, and it will ask you to approve them.
+
+**The manual way:** copy [`settings.example.json`](settings.example.json) into your project's `.claude/settings.json`, or merge it into `%USERPROFILE%\.claude\settings.json` for all projects, replacing the EXE path with your **absolute path** in all five places. Mapping:
 
 | Event | Status pushed |
 |---|---|
@@ -69,7 +75,9 @@ Schema verified against Claude Code 2.1.218: `UserPromptSubmit` and `Stop` take 
 
 ## 5. Run at login
 
-No-admin option — a shortcut in the Startup folder (`shell:startup`):
+**The easy way:** tick **Start the daemon automatically when I log in** in the Setup hooks dialog. It manages a Startup-folder shortcut for you, needs no admin rights, and unticking removes it.
+
+Manual equivalent — a shortcut in the Startup folder (`shell:startup`):
 
 ```powershell
 $ws = New-Object -ComObject WScript.Shell
@@ -88,6 +96,19 @@ schtasks /Create /TN "Claude RPC" /TR "C:\path\to\dist\claude-rpc\claude-rpc.exe
 Keep it interactive (run-only-when-logged-on) — Discord RPC uses a per-user named pipe, so the daemon must run in your logon session. Run the `setx` from step 3 first; processes started from a shell that predates the `setx` won't see the variable.
 
 ## 6. Verifying the connection
+
+**Click "Check my setup"** — it runs through every failure mode this thing has and tells you which one you're in, with the fix:
+
+- Application ID present, and where it came from (env var vs saved)
+- The Discord app exists (a wrong ID gives a clear "Discord doesn't recognise this" rather than silence), what its **name** is — that name is the banner's title line — and whether the `claude` art asset is actually uploaded
+- All five hooks wired in your project, pointing at *this* EXE (it catches entries left at an old path after you move the folder)
+- Daemon running, connected to Discord
+- Whether a hook has fired recently — this is what tells you the wiring genuinely works, as opposed to looking right in the file
+- Whether codex-rpc is also connected, since one Discord client only shows one activity
+
+The checks are read-only and safe to run any time. Only the Discord-app checks need internet; presence itself is entirely local.
+
+Manual checks, if you prefer:
 
 - **The status UI** — double-click the EXE: Daemon and Discord rows should both be green, and Activity should update as hooks fire.
 - **Daemon log** — `%TEMP%\claude_rpc_daemon.log` shows `connected to Discord RPC` and `presence -> <model> / <state>` lines as hooks fire. Repeated `Discord not reachable` lines mean Discord isn't running or the pipe is blocked.

@@ -15,9 +15,12 @@ there is no console to print to).
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 TEMP = os.environ.get("TEMP") or "."
 STATE_FILE = os.path.join(TEMP, "claude_rpc")
@@ -27,21 +30,30 @@ LOG_FILE = os.path.join(TEMP, "claude_rpc_daemon.log")
 CONFIG_FILE = os.path.join(os.environ.get("APPDATA") or TEMP, "claude-rpc.json")
 
 
-def get_app_id() -> str:
-    """Env var wins; otherwise the ID saved from the UI."""
-    app_id = (os.environ.get("DISCORD_APP_ID") or "").strip()
-    if app_id:
-        return app_id
+def load_config() -> dict:
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return str(json.load(f).get("app_id") or "").strip()
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return ""
+        return {}
+
+
+def save_config(**fields) -> None:
+    data = load_config()
+    data.update(fields)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_app_id() -> str:
+    """Env var wins; otherwise the ID saved from the UI."""
+    env = (os.environ.get("DISCORD_APP_ID") or "").strip()
+    return env or str(load_config().get("app_id") or "").strip()
 
 
 def save_app_id(app_id: str) -> None:
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"app_id": app_id.strip()}, f)
+    save_config(app_id=app_id.strip())
 
 VALID_STATUSES = ("thinking", "tool", "idle")
 
@@ -264,6 +276,261 @@ def daemon_mode() -> int:
         return 0
 
 
+# ------------------------------------------------------------ setup & doctor
+
+ASSET_NAME = "claude"
+API = "https://discord.com/api/v9/oauth2/applications"
+
+# (event, status argument, whether the event takes a matcher) - schema as of
+# Claude Code 2.1.x: UserPromptSubmit and Stop take no matcher.
+HOOK_EVENTS = [
+    ("SessionStart", "idle", True),      # also captures the model name
+    ("UserPromptSubmit", "thinking", False),
+    ("PreToolUse", "tool", True),
+    ("PostToolUse", "thinking", True),
+    ("Stop", "idle", False),
+]
+
+OK, WARN, BAD = "ok", "warn", "bad"
+
+
+def settings_path_for(project_dir: str) -> str:
+    return os.path.join(project_dir, ".claude", "settings.json")
+
+
+def load_settings(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def _is_ours(hook, exe_name: str) -> bool:
+    cmd = (hook or {}).get("command")
+    return isinstance(cmd, str) and exe_name.lower() in cmd.lower()
+
+
+def _strip_ours(groups, exe_name: str) -> list:
+    """Remove our hook entries; everything else is left exactly as found."""
+    kept = []
+    for g in groups if isinstance(groups, list) else []:
+        if not isinstance(g, dict):
+            kept.append(g)
+            continue
+        inner = [h for h in (g.get("hooks") or []) if not _is_ours(h, exe_name)]
+        if inner:
+            ng = dict(g)
+            ng["hooks"] = inner
+            kept.append(ng)
+    return kept
+
+
+def wire_hooks(project_dir: str, exe: str, remove: bool = False) -> str:
+    """Merge our five hooks into settings.json, preserving any other content.
+    Re-running is idempotent: our old entries (even at stale paths) are replaced.
+    """
+    path = settings_path_for(project_dir)
+    data = load_settings(path)
+    if not isinstance(data, dict):
+        raise ValueError("settings.json does not contain a JSON object")
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    exe_name = os.path.basename(exe)
+
+    for event, status, needs_matcher in HOOK_EVENTS:
+        kept = _strip_ours(hooks.get(event), exe_name)
+        if not remove:
+            entry = {"matcher": "*"} if needs_matcher else {}
+            entry["hooks"] = [{"type": "command",
+                               "command": f'"{exe}" {status}',
+                               "timeout": 10}]
+            kept.append(entry)
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+
+    if hooks:
+        data["hooks"] = hooks
+    else:
+        data.pop("hooks", None)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    return path
+
+
+def hooks_status(project_dir: str, exe: str):
+    """(events wired to this exe, other paths our hooks point at)."""
+    data = load_settings(settings_path_for(project_dir))
+    hooks = data.get("hooks") if isinstance(data, dict) else {}
+    exe_name = os.path.basename(exe)
+    wired, stale = [], set()
+    for event, _status, _m in HOOK_EVENTS:
+        for g in (hooks or {}).get(event) or []:
+            for h in (g or {}).get("hooks") or []:
+                if _is_ours(h, exe_name):
+                    cmd = h.get("command", "")
+                    if exe.lower() in cmd.lower():
+                        wired.append(event)
+                    else:
+                        stale.add(cmd)
+    return sorted(set(wired)), sorted(stale)
+
+
+def discord_get(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": "claude-rpc"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+
+def check_discord_app(out: list, app_id: str) -> None:
+    try:
+        info = discord_get(f"{API}/{app_id}/rpc")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            out.append((BAD, "Discord doesn't recognise this Application ID",
+                        "Copy the ID from General Information at "
+                        "discord.com/developers/applications."))
+        else:
+            out.append((WARN, f"Discord API returned HTTP {exc.code}",
+                        "Not fatal - try again in a moment."))
+        return
+    except Exception as exc:
+        out.append((WARN, f"Couldn't reach Discord's API ({exc.__class__.__name__})",
+                    "Only this check needs internet; presence itself is local."))
+        return
+
+    name = info.get("name") or "(unnamed)"
+    out.append((OK, f'Discord app found: "{name}"',
+                "This name is the banner's title line."))
+    try:
+        names = [a.get("name") for a in discord_get(f"{API}/{app_id}/assets")]
+    except Exception as exc:
+        out.append((WARN, f"Couldn't list art assets ({exc.__class__.__name__})", ""))
+        return
+    if ASSET_NAME in names:
+        out.append((OK, f'Art asset "{ASSET_NAME}" uploaded', ""))
+    elif info.get("icon"):
+        out.append((WARN, f'No art asset named "{ASSET_NAME}"'
+                          + (f" (found: {', '.join(n for n in names if n)})" if names else ""),
+                    "The card falls back to your app icon, so it still looks fine. "
+                    f'For the intended image, upload a 512x512 PNG named exactly '
+                    f'"{ASSET_NAME}" under Rich Presence -> Art Assets.'))
+    else:
+        out.append((BAD, f'No art asset "{ASSET_NAME}" and no app icon',
+                    "The card will show a blank image. Upload a 512x512 PNG named "
+                    f'exactly "{ASSET_NAME}" under Rich Presence -> Art Assets.'))
+
+
+def run_checks(exe: str, project_dir: str) -> list:
+    """[(level, headline, fix), ...] - safe to call off the UI thread."""
+    out = []
+
+    app_id = get_app_id()
+    if app_id.isdigit():
+        src = "environment variable" if os.environ.get("DISCORD_APP_ID", "").strip() \
+            else "saved settings"
+        out.append((OK, f"Application ID set ({app_id}, from {src})", ""))
+        check_discord_app(out, app_id)
+    else:
+        out.append((BAD, "No Discord Application ID",
+                    "Paste it into the Application ID box and click Save."))
+
+    if project_dir:
+        wired, stale = hooks_status(project_dir, exe)
+        missing = [e for e, _s, _m in HOOK_EVENTS if e not in wired]
+        if not missing:
+            out.append((OK, f"All 5 hooks wired in {settings_path_for(project_dir)}", ""))
+        elif wired:
+            out.append((WARN, f"Only {len(wired)} of 5 hooks wired "
+                              f"(missing: {', '.join(missing)})",
+                        "Open Setup hooks and wire this folder again."))
+        else:
+            out.append((BAD, f"No hooks for this EXE in {project_dir}",
+                        "Open Setup hooks, pick this project folder, and click "
+                        "Wire hooks here."))
+        if stale:
+            out.append((WARN, "Hooks here point at a different copy of the EXE",
+                        "Wiring again repoints them at this one: " + stale[0]))
+    else:
+        out.append((WARN, "No project folder chosen to check",
+                    "Open Setup hooks and pick the project you use Claude Code in."))
+
+    pid = daemon_pid()
+    hb = read_json_file(HEARTBEAT_FILE)
+    if pid:
+        out.append((OK, f"Daemon running (pid {pid})", ""))
+        state = hb.get("discord")
+        if state == "connected":
+            out.append((OK, "Connected to Discord", ""))
+        elif state == "no_app_id":
+            out.append((BAD, "Daemon is waiting for an Application ID",
+                        "Save the ID; the daemon picks it up within 5 seconds."))
+        else:
+            out.append((WARN, "Daemon can't reach Discord yet",
+                        "Start the Discord desktop app - the browser version has no "
+                        "RPC socket. The daemon retries every 15 seconds."))
+    else:
+        out.append((BAD, "Daemon not running", "Click Start daemon."))
+
+    try:
+        age = time.time() - os.path.getmtime(STATE_FILE)
+        if age < 900:
+            out.append((OK, f"A hook fired {int(age)}s ago - Claude Code is "
+                            "driving the banner", ""))
+        else:
+            out.append((WARN, f"Last hook fired {int(age / 60)} min ago",
+                        "Normal if you haven't used Claude Code since. If you have, "
+                        "restart the session so it reloads hooks."))
+    except OSError:
+        out.append((WARN, "No hook has ever fired",
+                    "Restart Claude Code after wiring hooks - it loads them at "
+                    "session start and will ask you to approve them."))
+
+    if read_json_file(os.path.join(TEMP, "codex_rpc_daemon.json")).get("discord") \
+            == "connected":
+        out.append((WARN, "codex-rpc is also connected to Discord",
+                    "One Discord client shows one activity, so only one banner is "
+                    "visible. Stop the other daemon, or run a second Discord client "
+                    "(PTB/Canary) to show both."))
+    return out
+
+
+def read_json_file(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def set_run_at_login(exe: str, enable: bool) -> str:
+    lnk = os.path.join(os.environ.get("APPDATA", TEMP), "Microsoft", "Windows",
+                       "Start Menu", "Programs", "Startup", "Claude RPC.lnk")
+    if not enable:
+        try:
+            os.remove(lnk)
+        except OSError:
+            pass
+        return "Removed from login startup."
+    ps = (f"$w = New-Object -ComObject WScript.Shell; "
+          f"$s = $w.CreateShortcut('{lnk}'); $s.TargetPath = '{exe}'; "
+          f"$s.Arguments = 'daemon'; "
+          f"$s.Description = 'Discord Rich Presence for Claude Code'; $s.Save()")
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                   capture_output=True, creationflags=0x08000000)
+    return "Added to login startup." if os.path.exists(lnk) else \
+        "Could not create the startup shortcut."
+
+
 # -------------------------------------------------------------------- UI mode
 
 BG = "#1e1f22"
@@ -286,8 +553,15 @@ def resource_path(name: str) -> str:
     return os.path.join(base, name)
 
 
+def exe_path() -> str:
+    return sys.executable if getattr(sys, "frozen", False) \
+        else os.path.abspath(__file__)
+
+
 def ui_mode() -> int:
+    import threading
     import tkinter as tk
+    from tkinter import filedialog
 
     root = tk.Tk()
     root.title("Claude RPC")
@@ -350,6 +624,135 @@ def ui_mode() -> int:
     start_btn.pack(side="left")
     stop_btn = styled_btn("Stop daemon", stop_daemon)
     stop_btn.pack(side="left", padx=(8, 0))
+
+    def dialog(title, pady=14):
+        win = tk.Toplevel(root)
+        win.title(title)
+        win.configure(bg=BG, padx=16, pady=pady)
+        win.transient(root)
+        try:
+            win.iconbitmap(resource_path("claude-rpc.ico"))
+        except Exception:
+            pass
+        return win
+
+    def dlg_btn(parent, text, cmd):
+        return tk.Button(parent, text=text, command=cmd, bg=CARD, fg=FG,
+                         activebackground="#404249", activeforeground=FG,
+                         relief="flat", font=("Segoe UI", 9), padx=12, pady=4)
+
+    def open_setup():
+        win = dialog("Setup hooks")
+        tk.Label(win, text="Wire Claude Code's hooks to this EXE", bg=BG, fg=FG,
+                 font=("Segoe UI Semibold", 10)).grid(row=0, column=0,
+                                                      columnspan=3, sticky="w")
+        tk.Label(win, text="Pick the folder you run Claude Code in. Anything already in "
+                           "settings.json is\nkept — only this app's entries are added or "
+                           "updated — and a .bak copy is saved.",
+                 bg=BG, fg=DIM, font=("Segoe UI", 8), justify="left").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
+
+        dir_var = tk.StringVar(value=load_config().get("project_dir", ""))
+        tk.Entry(win, textvariable=dir_var, bg=CARD, fg=FG, insertbackground=FG,
+                 relief="flat", width=58, font=("Consolas", 9)).grid(
+            row=2, column=0, columnspan=2, sticky="w", ipady=3)
+
+        def browse():
+            d = filedialog.askdirectory(parent=win, title="Choose your project folder")
+            if d:
+                dir_var.set(os.path.normpath(d))
+
+        dlg_btn(win, "Browse…", browse).grid(row=2, column=2, sticky="w", padx=(8, 0))
+
+        result = tk.Label(win, text="", bg=BG, fg=YELLOW, font=("Segoe UI", 9),
+                          wraplength=520, justify="left")
+        result.grid(row=4, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        def apply(remove=False, glob=False):
+            d = os.path.expanduser("~") if glob else dir_var.get().strip()
+            if not d or not os.path.isdir(d):
+                result.config(text="Choose a folder first.", fg=YELLOW)
+                return
+            try:
+                path = wire_hooks(d, exe_path(), remove=remove)
+            except Exception as exc:
+                result.config(text=f"Failed: {exc}", fg=RED)
+                return
+            if not glob:
+                save_config(project_dir=d)
+            if remove:
+                result.config(text=f"Removed this app's hooks from {path}", fg=GREEN)
+            else:
+                result.config(text=f"Wired 5 hooks into {path}\n\nRestart your Claude "
+                                   "Code session in that folder — hooks load at session "
+                                   "start, and it will ask you to approve them.", fg=GREEN)
+
+        row = tk.Frame(win, bg=BG)
+        row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        dlg_btn(row, "Wire hooks here", apply).pack(side="left")
+        dlg_btn(row, "Wire globally (all projects)",
+                lambda: apply(glob=True)).pack(side="left", padx=(8, 0))
+        dlg_btn(row, "Remove hooks",
+                lambda: apply(remove=True)).pack(side="left", padx=(8, 0))
+
+        lnk = os.path.join(os.environ.get("APPDATA", TEMP), "Microsoft", "Windows",
+                           "Start Menu", "Programs", "Startup", "Claude RPC.lnk")
+        login_var = tk.BooleanVar(value=os.path.exists(lnk))
+
+        def toggle_login():
+            result.config(text=set_run_at_login(exe_path(), login_var.get()), fg=GREEN)
+
+        tk.Checkbutton(win, text="Start the daemon automatically when I log in",
+                       variable=login_var, command=toggle_login, bg=BG, fg=DIM,
+                       selectcolor=CARD, activebackground=BG, activeforeground=FG,
+                       font=("Segoe UI", 9)).grid(row=5, column=0, columnspan=3,
+                                                  sticky="w", pady=(12, 0))
+
+    def open_doctor():
+        win = dialog("Check my setup")
+        txt = tk.Text(win, width=88, height=22, bg=CARD, fg=FG, relief="flat",
+                      font=("Segoe UI", 9), state="disabled", padx=12, pady=10,
+                      wrap="word", spacing1=2, spacing3=2)
+        txt.grid(row=0, column=0, sticky="ew")
+        txt.tag_configure(OK, foreground=GREEN)
+        txt.tag_configure(WARN, foreground=YELLOW)
+        txt.tag_configure(BAD, foreground=RED)
+        txt.tag_configure("fix", foreground=DIM, lmargin1=22, lmargin2=22)
+
+        def render(results):
+            marks = {OK: "OK   ", WARN: "!    ", BAD: "X    "}
+            txt.config(state="normal")
+            txt.delete("1.0", "end")
+            for level, headline, fix in results:
+                txt.insert("end", marks[level] + headline + "\n", level)
+                if fix:
+                    txt.insert("end", fix + "\n", "fix")
+                txt.insert("end", "\n")
+            bad = sum(1 for lvl, _, _ in results if lvl == BAD)
+            warn = sum(1 for lvl, _, _ in results if lvl == WARN)
+            if bad:
+                txt.insert("end", f"{bad} thing(s) need fixing.", BAD)
+            elif warn:
+                txt.insert("end", "Working, with some notes above.", WARN)
+            else:
+                txt.insert("end", "Everything checks out.", OK)
+            txt.config(state="disabled")
+
+        def run():
+            render([(WARN, "Checking…", "")])
+
+            def work():
+                results = run_checks(exe_path(), load_config().get("project_dir", ""))
+                root.after(0, lambda: render(results))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        dlg_btn(win, "Re-run", run).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        run()
+
+    setup_btn = styled_btn("Setup hooks…", open_setup)
+    setup_btn.pack(side="left", padx=(8, 0))
+    styled_btn("Check my setup", open_doctor).pack(side="left", padx=(8, 0))
 
     idrow = tk.Frame(root, bg=BG)
     idrow.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
